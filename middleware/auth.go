@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"net/http"
 	"strings"
 
 	goxis "github.com/AndresGT/Goxis/app"
@@ -21,23 +20,28 @@ type AccessTokenValidator interface {
 }
 
 // RequireAuth validates the bearer token and stores its Claims in the request
-// context. Refresh tokens are never accepted on protected API routes.
+// context. On failure it returns a Goxis sentinel; the app serializes the error
+// response. Refresh tokens are never accepted on protected API routes.
 func RequireAuth(manager AccessTokenValidator) goxis.Middleware {
 	return func(next goxis.Handler) goxis.Handler {
 		return func(ctx *goxis.Context) error {
 			if manager == nil {
 				return goxis.ErrAccessControlUnavailable
 			}
+			if claims, ok := ClaimsFromContext(ctx); ok {
+				ctx.SetAuthenticatedIdentity(claims.UserID)
+				return next(ctx)
+			}
 			parts := strings.Fields(ctx.Request.Header.Get("Authorization"))
 			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
-				return unauthorized(ctx)
+				return goxis.ErrUnauthenticated
 			}
 			claims, err := manager.ValidateAccessToken(parts[1])
 			if err != nil {
-				return unauthorized(ctx)
+				return goxis.ErrUnauthenticated
 			}
 			setClaims(ctx, claims)
-			ctx.MarkAuthenticated()
+			ctx.SetAuthenticatedIdentity(claims.UserID)
 			return next(ctx)
 		}
 	}
@@ -66,9 +70,4 @@ func MustClaims(ctx *goxis.Context) token.Claims {
 		panic("middleware: claims are unavailable; ensure this handler is behind a protected route with an Authorizer")
 	}
 	return claims
-}
-
-func unauthorized(ctx *goxis.Context) error {
-	_ = ctx.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-	return nil
 }

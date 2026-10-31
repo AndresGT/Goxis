@@ -57,6 +57,8 @@ app := goxis.New(goxis.WithAuthorizer(rbac))
 
 `RBAC` implementa `goxis.Authorizer`: antes de invocar el handler de una ruta protegida valida `Authorization: Bearer <access_token>`, guarda los claims en el contexto y revisa la política que el router adjuntó a la ruta. Token ausente, inválido, expirado o refresh responde `401` y no ejecuta el handler; identidad válida sin rol o permiso requerido responde `403`.
 
+`RequireAuth` también devuelve `goxis.ErrUnauthenticated` cuando falta el access token o no es válido; no escribe la respuesta por su cuenta. El core convierte errores centinela a JSON (`{"error":"unauthorized"}` para `401`, `{"error":"forbidden"}` para `403`) de manera uniforme. No expongas al cliente los detalles internos de validación criptográfica.
+
 ## Definir las rutas en Goxis
 
 Los módulos siguen registrando sus rutas por separado. Los endpoints públicos pueden usar límite y cola sin configurar middleware de auth:
@@ -160,6 +162,6 @@ Para una allowlist más estrecha por ambiente, define solamente los orígenes re
 
 ## Rate limits y colas del core
 
-`RateLimit` permite ese número de solicitudes por IP cada minuto; se implementa en memoria por ruta y por instancia. Si se supera, Goxis responde `429`. No confíes en `X-Forwarded-For` sin un proxy inverso explícitamente confiable; el rate limit usa `RemoteAddr`.
+`RateLimit` permite ese número de solicitudes por identidad cada minuto y por ruta. Con `middleware.RBAC`, Goxis valida el access token antes de limitar y usa el `UserID` autenticado (`sub` del token); usuarios distintos detrás de una misma IP tienen contadores separados, y el mismo usuario mantiene su contador aunque cambie de IP. Sin una identidad verificada se usa `RemoteAddr`. Un authorizer personalizado debe implementar también `goxis.IdentityAuthenticator` y llamar `ctx.SetAuthenticatedIdentity(userID)` después de validar credenciales. El almacenamiento sigue siendo en memoria, por instancia; no confíes en `X-Forwarded-For` salvo que configures explícitamente un proxy confiable.
 
 `MaxConcurrent` limita cuántos handlers de una ruta se ejecutan al mismo tiempo. `QueueLimit` fija cuántas solicitudes adicionales pueden esperar; al llenarse la capacidad disponible, Goxis responde `503`. Una solicitud que cancela su contexto mientras espera sale de la cola. Ambos valores son por ruta y proceso; cero significa sin límite/concurrencia ilimitada para `MaxConcurrent`, y sin espera adicional para `QueueLimit`.

@@ -13,7 +13,7 @@ type Route struct {
 	Path          string
 	Handler       Handler
 	Protected     bool
-	RateLimit     int      // Requests per minute from one client IP; zero disables it.
+	RateLimit     int      // Requests per minute per authenticated user, or per client IP when unauthenticated; zero disables it.
 	MaxConcurrent int      // Maximum handlers running for this route; zero is unlimited.
 	QueueLimit    int      // Additional waiting requests; zero disables queuing.
 	Roles         []string // One of these roles is sufficient for this route.
@@ -94,6 +94,12 @@ func (group *Group) RegisterRoutes(routes []Route) error {
 		if method == "" || route.Handler == nil || !validPattern(path) {
 			return fmt.Errorf("%w: method, handler, or path is invalid (%q %q)", ErrInvalidRoute, route.Method, path)
 		}
+		group.app.mu.RLock()
+		admin := group.app.adminPanel
+		group.app.mu.RUnlock()
+		if admin != nil && routeOverlapsAdmin(path, admin.base) {
+			return fmt.Errorf("%w: %s %s overlaps the Goxis admin panel", ErrInvalidRoute, method, path)
+		}
 		if route.RateLimit < 0 || route.MaxConcurrent < 0 || route.QueueLimit < 0 || (route.QueueLimit > 0 && route.MaxConcurrent == 0) || route.MaxConcurrent > maxRouteQueueCapacity || route.QueueLimit > maxRouteQueueCapacity-route.MaxConcurrent {
 			return fmt.Errorf("%w: invalid rate limit or queue configuration for %s %s", ErrInvalidRoute, method, path)
 		}
@@ -151,10 +157,30 @@ func (group *Group) RegisterRoutes(routes []Route) error {
 	}
 	group.app.routes = append(group.app.routes, entries...)
 	group.app.mu.Unlock()
+	group.app.mu.RLock()
+	admin := group.app.adminPanel
+	group.app.mu.RUnlock()
+	if admin != nil {
+		admin.publish("routes", map[string]any{"routes": admin.routes()})
+		admin.publishQueueSnapshot()
+	}
 	for _, entry := range entries {
 		logRouteRegistered(entry)
 	}
 	return nil
+}
+
+func routeOverlapsAdmin(routePath, adminBase string) bool {
+	routeParts, adminParts := splitPath(routePath), splitPath(adminBase)
+	if len(routeParts) < len(adminParts) {
+		return false
+	}
+	for i, adminPart := range adminParts {
+		if routeParamName(routeParts[i]) == "" && routeParts[i] != adminPart {
+			return false
+		}
+	}
+	return true
 }
 
 func routePatternsConflict(a, b routeEntry) bool {

@@ -1,6 +1,7 @@
 package goxis
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -25,6 +26,8 @@ var (
 	ErrUnauthenticated          = errors.New("goxis: unauthenticated")
 	ErrForbidden                = errors.New("goxis: forbidden")
 	ErrAccessControlUnavailable = errors.New("goxis: access control is not configured")
+	ErrRateLimitExceeded        = errors.New("goxis: rate limit exceeded")
+	ErrQueueFull                = errors.New("goxis: request queue is full")
 	ErrInvalidRoute             = errors.New("goxis: invalid route")
 	ErrDuplicateRoute           = errors.New("goxis: duplicate route")
 )
@@ -41,6 +44,13 @@ type Middleware func(Handler) Handler
 // method is called.
 type Authorizer interface {
 	Authorize(ctx *Context, policy Policy) error
+}
+
+// IdentityAuthenticator validates request credentials and stores a trusted
+// identity on Context before route rate limiting. Authorizers that implement
+// it enable per-user limits without making the app depend on token packages.
+type IdentityAuthenticator interface {
+	Authenticate(ctx *Context) error
 }
 
 // Policy supports roles that must all match, an alternative role list where
@@ -68,6 +78,8 @@ type App struct {
 	startupErr     error
 	authorizer     Authorizer
 	serverConfig   HTTPServerConfig
+	adminPanel     *adminPanel
+	metrics        *requestMetrics
 }
 
 // New creates an application.
@@ -79,6 +91,31 @@ func New(options ...Option) *App {
 		}
 	}
 	return app
+}
+
+// Close releases resources owned by optional App components, including the
+// admin panel's persistent log writer. Call it after the HTTP server stops.
+func (app *App) Close() error {
+	if app == nil {
+		return nil
+	}
+	app.mu.RLock()
+	admin := app.adminPanel
+	app.mu.RUnlock()
+	if admin != nil {
+		return admin.close()
+	}
+	return nil
+}
+
+// RouteCount returns the number of routes registered on the application.
+func (app *App) RouteCount() int {
+	if app == nil {
+		return 0
+	}
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return len(app.routes)
 }
 
 // Use registers middleware for every route in the application.
@@ -116,21 +153,51 @@ func (app *App) Group(prefix string, options ...GroupOption) *Group {
 // ServeHTTP lets App be used as an HTTP handler while keeping routing and
 // request context APIs owned by Goxis.
 func (app *App) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	request, _ = attachRequestID(request, writer)
 	started := time.Now()
 	recorder := &responseRecorder{ResponseWriter: writer}
+	app.mu.RLock()
+	metrics := app.metrics
+	admin := app.adminPanel
+	app.mu.RUnlock()
+	isAdminRequest := admin != nil && admin.matches(request.URL.Path)
+	if isAdminRequest {
+		metrics = nil
+	}
+	if metrics != nil {
+		metrics.begin()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if recorder.status == 0 {
-				http.Error(recorder, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				writeError(recorder, http.StatusInternalServerError)
 			}
-			logRequest(request, recorder.status, time.Since(started))
+			if metrics != nil {
+				detail := app.requestRecord(request, recorder.status, time.Since(started))
+				metrics.finish(detail)
+				if admin != nil {
+					admin.publish("request", detail)
+				}
+			}
+			if !isAdminRequest {
+				logRequest(request, recorder.status, time.Since(started))
+			}
 			return
 		}
 		status := recorder.status
 		if status == 0 {
 			status = http.StatusOK
 		}
-		logRequest(request, status, time.Since(started))
+		if metrics != nil {
+			detail := app.requestRecord(request, status, time.Since(started))
+			metrics.finish(detail)
+			if admin != nil {
+				admin.publish("request", detail)
+			}
+		}
+		if !isAdminRequest {
+			logRequest(request, status, time.Since(started))
+		}
 	}()
 
 	app.mu.RLock()
@@ -138,6 +205,9 @@ func (app *App) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	app.mu.RUnlock()
 
 	var handler http.Handler = http.HandlerFunc(app.serveRoutes)
+	if admin != nil && admin.matches(request.URL.Path) {
+		handler = admin
+	}
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		handler = middlewares[i](handler)
 	}
@@ -150,6 +220,7 @@ func (app *App) serveRoutes(writer http.ResponseWriter, request *http.Request) {
 	entry, params, pathFound := app.findRoute(path, request.Method)
 	globalMiddleware := append([]Middleware(nil), app.middleware...)
 	authorizer := app.authorizer
+	admin := app.adminPanel
 	allow := ""
 	if pathFound && entry == nil {
 		allow = allowedMethods(app.routes, path)
@@ -167,20 +238,43 @@ func (app *App) serveRoutes(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	ctx := newContext(writer, request, params)
-	handler := entry.handler
-	if entry.limiter != nil && !entry.limiter.allow(remoteIP(request.RemoteAddr), time.Now()) {
-		writer.Header().Set("Retry-After", "60")
-		writeError(writer, http.StatusTooManyRequests)
-		return
+	hasPolicy := len(entry.policy.Roles) > 0 || len(entry.policy.AnyRole) > 0 || len(entry.policy.Permissions) > 0
+	secured := entry.protected || hasPolicy
+	var authenticationErr error
+	if authenticator, ok := authorizer.(IdentityAuthenticator); ok && strings.TrimSpace(request.Header.Get("Authorization")) != "" {
+		authenticationErr = authenticator.Authenticate(ctx)
+		if !secured {
+			authenticationErr = nil
+		}
 	}
+	handler := entry.handler
 	if entry.queue != nil {
 		next := handler
 		handler = func(ctx *Context) error {
-			release, admitted := entry.queue.acquire(ctx.Request.Context())
-			if !admitted {
-				if ctx.Request.Context().Err() == nil {
+			notifyQueue := func() {
+				if admin != nil {
+					admin.publishQueueRoute(entry)
+				}
+			}
+			release, admission := entry.queue.acquire(ctx.Request.Context(), notifyQueue)
+			if admission != queueAdmitted {
+				reason := "queue_full"
+				if admission == queueCanceled {
+					reason = "request_canceled_while_waiting"
+				}
+				failure := queueFailure{
+					Timestamp: time.Now(), Method: entry.method, Route: entry.method + " " + entry.path,
+					Group: entry.group, Path: safeRequestURI(ctx.Request.URL), Reason: reason,
+					ClientIP: remoteIP(ctx.Request.RemoteAddr), RequestID: ctx.RequestID(),
+				}
+				entry.queue.recordFailure(failure)
+				if admin != nil {
+					admin.publish("queue_failure", failure)
+				}
+				notifyQueue()
+				if admission == queueRejected {
 					ctx.Writer.Header().Set("Retry-After", "1")
-					writeError(ctx.Writer, http.StatusServiceUnavailable)
+					writeAppError(ctx.Writer, ErrQueueFull)
 				}
 				return nil
 			}
@@ -188,10 +282,12 @@ func (app *App) serveRoutes(writer http.ResponseWriter, request *http.Request) {
 			return next(ctx)
 		}
 	}
-	if entry.protected || len(entry.policy.Roles) > 0 || len(entry.policy.AnyRole) > 0 || len(entry.policy.Permissions) > 0 {
+	if secured {
 		next := handler
 		handler = func(ctx *Context) error {
-			hasPolicy := len(entry.policy.Roles) > 0 || len(entry.policy.AnyRole) > 0 || len(entry.policy.Permissions) > 0
+			if authenticationErr != nil {
+				return authenticationErr
+			}
 			if authorizer == nil && hasPolicy {
 				return ErrAccessControlUnavailable
 			}
@@ -206,20 +302,30 @@ func (app *App) serveRoutes(writer http.ResponseWriter, request *http.Request) {
 			return next(ctx)
 		}
 	}
+	if entry.limiter != nil {
+		next := handler
+		handler = func(ctx *Context) error {
+			key := ctx.Identity()
+			if key != "" {
+				key = "user:" + key
+			} else {
+				key = "ip:" + remoteIP(request.RemoteAddr)
+			}
+			if !entry.limiter.allow(key, time.Now()) {
+				ctx.Writer.Header().Set("Retry-After", "60")
+				writeAppError(ctx.Writer, ErrRateLimitExceeded)
+				return nil
+			}
+			return next(ctx)
+		}
+	}
 
 	middlewares := append(globalMiddleware, entry.middleware...)
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		handler = middlewares[i](handler)
 	}
 	if err := handler(ctx); err != nil && !ctx.Written() {
-		status := http.StatusInternalServerError
-		switch {
-		case errors.Is(err, ErrUnauthenticated):
-			status = http.StatusUnauthorized
-		case errors.Is(err, ErrForbidden):
-			status = http.StatusForbidden
-		}
-		writeError(writer, status)
+		writeAppError(writer, err)
 	}
 }
 
@@ -267,5 +373,50 @@ func allowedMethods(routes []routeEntry, path string) string {
 }
 
 func writeError(writer http.ResponseWriter, status int) {
-	http.Error(writer, http.StatusText(status), status)
+	code := "internal_server_error"
+	switch status {
+	case http.StatusBadRequest:
+		code = "bad_request"
+	case http.StatusUnauthorized:
+		code = "unauthorized"
+	case http.StatusForbidden:
+		code = "forbidden"
+	case http.StatusNotFound:
+		code = "not_found"
+	case http.StatusMethodNotAllowed:
+		code = "method_not_allowed"
+	case http.StatusTooManyRequests:
+		code = "rate_limit_exceeded"
+	case http.StatusServiceUnavailable:
+		code = "service_unavailable"
+	}
+	writeJSONError(writer, status, code)
+}
+
+func writeAppError(writer http.ResponseWriter, err error) {
+	status, code := http.StatusInternalServerError, "internal_server_error"
+	switch {
+	case errors.Is(err, ErrUnauthenticated):
+		status, code = http.StatusUnauthorized, "unauthorized"
+	case errors.Is(err, ErrForbidden):
+		status, code = http.StatusForbidden, "forbidden"
+	case errors.Is(err, ErrNotFound):
+		status, code = http.StatusNotFound, "not_found"
+	case errors.Is(err, ErrMethodNotAllowed):
+		status, code = http.StatusMethodNotAllowed, "method_not_allowed"
+	case errors.Is(err, ErrRateLimitExceeded):
+		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
+	case errors.Is(err, ErrQueueFull):
+		status, code = http.StatusServiceUnavailable, "service_unavailable"
+	}
+	writeJSONError(writer, status, code)
+}
+
+func writeJSONError(writer http.ResponseWriter, status int, code string) {
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("X-Content-Type-Options", "nosniff")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(struct {
+		Error string `json:"error"`
+	}{Error: code})
 }

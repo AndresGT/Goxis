@@ -85,7 +85,7 @@ func (w *responseRecorder) ReadFrom(reader io.Reader) (int64, error) {
 type responseWriterOnly struct{ http.ResponseWriter }
 
 func logRequest(request *http.Request, status int, duration time.Duration) {
-	goxislog.HTTPRequest(request.Method, safeRequestURI(request.URL), status, remoteIP(request.RemoteAddr), duration)
+	goxislog.HTTPRequestWithID(request.Method, safeRequestURI(request.URL), status, remoteIP(request.RemoteAddr), duration, requestIDFromRequest(request))
 }
 
 var sensitiveQueryKeys = map[string]struct{}{

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLogLevelsAndColors(t *testing.T) {
@@ -66,6 +67,27 @@ func TestJSONFormatAndFields(t *testing.T) {
 	}
 	if record.Fields["user_id"] != "u-123" || record.Fields["active"] != true {
 		t.Fatalf("unexpected JSON fields: %#v", record.Fields)
+	}
+}
+
+func TestHTTPRequestWithIDInTextAndJSON(t *testing.T) {
+	const requestID = "00112233445566778899aabbccddeeff"
+	var textOutput bytes.Buffer
+	textLogger := New(WithWriter(&textOutput), WithColor(false), WithTimeFormat(""))
+	textLogger.HTTPRequestWithID("GET", "/items", 200, "127.0.0.1", 5*time.Millisecond, requestID)
+	if !strings.Contains(textOutput.String(), "request_id="+requestID) {
+		t.Fatalf("request ID missing from text access log: %q", textOutput.String())
+	}
+
+	var jsonOutput bytes.Buffer
+	jsonLogger := New(WithWriter(&jsonOutput), WithFormat(FormatJSON), WithTimeFormat(""))
+	jsonLogger.HTTPRequestWithID("GET", "/items", 200, "127.0.0.1", 5*time.Millisecond, requestID)
+	var record Record
+	if err := json.Unmarshal(bytes.TrimSpace(jsonOutput.Bytes()), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Fields["request_id"] != requestID {
+		t.Fatalf("request ID missing from JSON access log: %#v", record.Fields)
 	}
 }
 

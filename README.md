@@ -1,122 +1,175 @@
 # Goxis
 
-Goxis is the platform's own HTTP application and routing layer. It provides a framework-owned `App`, route groups, request `Context`, middleware, and group access policies. The HTTP transport uses Go's standard library internally; application modules register routes through Goxis APIs.
+<p align="center"><img src="assets/brand/goxis-logo.jpeg" alt="Logo de Goxis" width="420"></p>
 
-## Project layout
+**Goxis** es la capa HTTP y de seguridad de la plataforma. Define su propia API de aplicación, rutas, grupos, contexto, middleware, políticas de acceso y colas por ruta. Usa `net/http` de Go como transporte; no depende de Gin ni Fiber.
+
+> Goxis está listo para iniciar pruebas de integración en una aplicación piloto. La API y los módulos de seguridad siguen evolucionando; revisa las limitaciones de esta guía antes de usarlo en producción.
+
+## Contenido
+
+- [Requisitos e instalación](#requisitos-e-instalación)
+- [Inicio rápido](#inicio-rápido)
+- [Rutas, grupos y límites](#rutas-grupos-y-límites)
+- [Middleware, CORS y autorización](#middleware-cors-y-autorización)
+- [Seguridad y tokens](#seguridad-y-tokens)
+- [Panel administrativo](#panel-administrativo)
+- [Estructura y ejemplos](#estructura-y-ejemplos)
+- [Verificación y preparación](#verificación-y-preparación)
+- [Licencia](#licencia)
+
+## Requisitos e instalación
+
+- Go `1.27.1` o compatible con la directiva `go` del módulo.
+- La dependencia directa `golang.org/x/crypto` se utiliza en los métodos de hashing de contraseñas. Goxis no requiere Gin, Fiber ni una biblioteca JWT externa.
+
+Añade el módulo al proyecto:
+
+```sh
+go get github.com/AndresGT/Goxis
+```
+
+## Inicio rápido
+
+Crea la aplicación en el inicializador, registra rutas desde grupos y deja `main` para iniciar el servidor:
+
+```go
+package main
+
+import (
+    "log"
+    "net/http"
+
+    goxis "github.com/AndresGT/Goxis/app"
+)
+
+func main() {
+    app := goxis.New()
+    api := app.Group("/api/v1")
+
+    err := api.RegisterRoutes([]goxis.Route{
+        {
+            Method: goxis.GET,
+            Path:   "/health",
+            Handler: func(ctx *goxis.Context) error {
+                return ctx.JSON(http.StatusOK, map[string]string{"status": "ok"})
+            },
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := app.Run(":8080"); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+Goxis valida método, ruta, handler y conflictos al registrar. Los parámetros dinámicos aceptan `:id` o `{id}` y se leen con `ctx.Param("id")`. Los handlers responden con `ctx.JSON`, `ctx.Text` u otros helpers de `Context`.
+
+## Rutas, grupos y límites
+
+Los módulos registran sus rutas dentro del grupo que recibe la aplicación:
+
+```go
+func RegisterProductRoutes(api *goxis.Group) error {
+    products := api.Group("/products")
+    return products.RegisterRoutes([]goxis.Route{
+        {Method: goxis.GET, Path: "/", Handler: listProducts, RateLimit: 60},
+        {
+            Method: goxis.POST, Path: "/sync", Handler: syncProducts,
+            Protected: true, Roles: []string{"admin"},
+            MaxConcurrent: 2, QueueLimit: 8,
+        },
+    })
+}
+```
+
+Cada ruta puede definir `Protected`, `Roles`, `Permissions`, `RateLimit`, `MaxConcurrent` y `QueueLimit`. El rate limit se aplica por usuario autenticado cuando el authorizer valida una identidad; sin identidad válida, usa la IP de `RemoteAddr`. Los límites y colas son locales al proceso y a cada instancia. El exceso de rate limit responde `429`; una cola llena responde `503`.
+
+Los grupos heredan middleware y políticas. Los roles y permisos heredados no se eliminan en grupos hijos. Consulta [app/README.md](app/README.md) para el comportamiento completo del router, handlers, servidor, colas y panel.
+
+## Middleware, CORS y autorización
+
+Configura el middleware desde el inicializador de rutas. Al aplicarse a un `*goxis.App`, se registra en la aplicación:
+
+```go
+app := goxis.New(goxis.WithAuthorizer(authorizer))
+
+middleware.CORS(middleware.CORSConfig{
+    AllowedOrigins: []string{"https://panel.example.com"},
+    AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+    AllowedHeaders: []string{"Authorization", "Content-Type", "Idempotency-Key"},
+})(app)
+
+api := app.Group("/api/v1")
+```
+
+`middleware.RBAC` valida el access token, añade claims al contexto y autoriza roles/permisos antes de ejecutar el handler. Las rutas protegidas responden `401` sin identidad válida y `403` sin permisos suficientes. CORS controla lo que el navegador puede leer; no sustituye autenticación ni autorización. `OriginGuard` es una opción explícita para rechazar orígenes ausentes o no registrados.
+
+Más detalles y ejemplos: [middleware/README.md](middleware/README.md).
+
+## Seguridad y tokens
+
+Los paquetes de seguridad se encuentran en `security/`:
+
+- `security/token`: generación y validación de access/refresh tokens cifrados, claims, expiración y rotación de refresh; soporta almacenamiento en memoria, Redis o SQL mediante sus interfaces.
+- `security/crypto`: hashing de contraseñas con Argon2id, bcrypt, scrypt y PBKDF2; cifrado AES-GCM y valores aleatorios.
+- `security/audit`: eventos, filtros y exportación en memoria a CSV, JSON o NDJSON.
+- `security`: niveles y errores comunes.
+
+Goxis implementa su formato de token con primitivas criptográficas estándar; no usa una biblioteca JWT externa. Antes de producción, define gestión/rotación de claves, persistencia compartida para varias instancias y expiraciones apropiadas. La revocación de refresh no invalida access tokens ya emitidos antes de que expiren. La guía de cada paquete documenta configuración y límites:
+
+- [Tokens y sesiones](security/token/README.md)
+- [Crypto](security/crypto/README.md)
+- [Auditoría](security/audit/README.md)
+- [Políticas y niveles](security/README.md)
+
+## Panel administrativo
+
+El panel opcional se sirve desde el mismo listener, por defecto en `/_goxis/admin`. Incluye logs, grupos y rutas, historial reciente por ruta, colas/rechazos y métricas del proceso Go. Usa una sesión de cookie `HttpOnly` y un flujo SSE para actualizar la interfaz; las rutas del panel se excluyen de los access logs y de las métricas de la API.
+
+Configúralo con `goxis.WithAdminPanel(...)`, un hash de contraseña y un `TokenManager` con secreto persistente. En HTTPS directo, Goxis marca la cookie `Secure`; detrás de un proxy que termina TLS, establece `SecureCookie: true`. Las métricas y el historial de solicitudes son muestras en memoria; los logs pueden persistir en archivo. El almacenamiento de colas y rate limits también es por proceso.
+
+`examples/appdemo` usa `admin/admin` solo para desarrollo local. No reutilices esas credenciales ni sus secretos de ejemplo. Consulta [app/README.md](app/README.md#panel-local-de-administración) y [examples/appdemo/README.md](examples/appdemo/README.md).
+
+## Estructura y ejemplos
 
 ```text
-.
-├── app/                                     # HTTP application, router and request context
-├── log/                                     # Global and instance logger
-├── middleware/                              # CORS, token auth and RBAC
-├── security/                                # crypto, token/session, audit and shared policy
-└── examples/                                # Runnable module demos
-    ├── appdemo/                             # Public/private/role route demo
-    ├── auditdemo/
-    ├── cryptodemo/
-    ├── logdemo/
-    ├── servicestokendemo/
-    └── tokendemo/
+app/                    Aplicación HTTP, router, contexto, servidor y panel
+middleware/             CORS, autenticación por token y RBAC
+security/               Tokens/sesiones, crypto, auditoría y políticas
+log/                    Logger global/instanciado y formatos de salida
+assets/brand/           Logo oficial
+examples/
+  appdemo/              Rutas públicas/protegidas, grupos, colas y panel
+  auditdemo/            Registro y consulta de auditoría
+  cryptodemo/            Hashing, cifrado y generación de claves
+  logdemo/               Niveles y configuración de logs
+  servicestokendemo/     Lectura de claims desde servicios
+  tokendemo/             Emisión, validación y rotación de tokens
 ```
 
-The core lives in `app/` and its package name is `goxis`, so application code uses `goxis.New()`. The `examples/appdemo` separates startup (`main.go`), initialization (`route.go`) and bulk route declarations/handlers (`registerroute.go`). Modules expose a registration function that accepts the group assigned by the application.
-
-```go
-server, tokens, err := InitRoutes()
-if err != nil {
-	log.Fatal(err)
-}
-_ = tokens // el demo imprime sus tokens para las peticiones de prueba
-if err := server.Run(":8080"); err != nil {
-	log.Fatal(err)
-}
-```
-
-```go
-// examples/appdemo/route.go
-func InitRoutes() (*goxis.App, DemoTokens, error) {
-	app := goxis.New(goxis.WithAuthorizer(authorizer))
-	api := app.Group("/api")
-	if err := RegisterDemoRoutes(api); err != nil { return nil, DemoTokens{}, err }
-	return app, demoTokens, nil
-}
-```
-
-## Route groups and policies
-
-Groups can inherit middleware, roles, and permissions. `WithRoles` requires every listed role. Permissions declared by a group are all required; child groups inherit those restrictions. Route-level `goxis.Route.Roles` accepts any of its listed roles.
-
-```go
-admin := api.Group("/admin",
-	goxis.WithRoles("admin"),
-	goxis.WithPermissions("users:read"),
-)
-err := users.RegisterRoutes(admin.Group("/users"))
-```
-
-Goxis owns route registration and per-route access, rate limit, and queue settings through `app.Group.RegisterRoutes([]goxis.Route{...})`. Configure token validation and role grants with the middleware authorizer passed to `goxis.New`; see [middleware/README.md](middleware/README.md) for the complete setup and method-to-permission mapping.
-
-The platform connects an `Authorizer` with `goxis.WithAuthorizer(...)`. It evaluates the accumulated policy before the route handler. A route with a policy fails closed with an internal server error if the app has no authorizer configured; an unauthenticated request receives 401 and an identity without the required role/grant receives 403.
-
-## CORS
-
-CORS and the optional strict `OriginGuard` are configured in the route initializer, keeping `main` focused on starting the app. When either middleware is applied to a Goxis app, it registers on that app; for another `http.Handler`, it returns the usual wrapped handler. Origins are explicit by default; the wildcard `"*"` is allowed only when credentials are disabled. Invalid origins, methods, headers, or a preflight cache over 24 hours fail closed.
-
-```go
-import (
-	goxis "github.com/AndresGT/Goxis/app"
-	"github.com/AndresGT/Goxis/middleware"
-)
-
-func InitRoutes() (*goxis.App, error) {
-	app := goxis.New()
-	allowedOrigins := []string{"https://panel.example.com"}
-	middleware.OriginGuard(allowedOrigins...)(app)
-	middleware.CORS(middleware.CORSConfig{
-		AllowedOrigins: allowedOrigins,
-		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"Authorization", "Content-Type", "Idempotency-Key"},
-	})(app)
-	return app, nil
-}
-```
-
-When omitted, methods default to `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`; headers default to `Authorization` and `Content-Type`. Omitted origins allow no browser origin. Preflight requests are answered before route matching, and a preflight with a disallowed origin, method, or header receives `403`. A regular request from a disallowed origin still reaches its route, but the browser will not expose the response to page code: CORS is a browser policy, not authentication or authorization.
-
-For local development, `localhost:3030` is accepted as shorthand for `http://localhost:3030`. Use a full `http://` or `https://` origin for other hosts.
-
-`OriginGuard` returns `403` for missing or unregistered `Origin` headers, including direct browser navigation and `curl`. Browsers send the allowed frontend origin for cross-origin API requests. This header can be forged by non-browser clients, so keep authentication and authorization on protected routes.
-
-## Ejecutar la prueba
+Ejecuta el demo de aplicación:
 
 ```sh
 go run ./examples/appdemo
 ```
 
-The demo includes a public endpoint, a private endpoint, a group restricted to the `admin` role, and a private group without a role restriction. It prints temporary admin/viewer access tokens so you can try both authorization outcomes. See [examples/appdemo/README.md](examples/appdemo/README.md) for the routes and PowerShell requests. Each `goxis.Route` can set `Protected`, `RateLimit`, `MaxConcurrent`, `QueueLimit`, and role/permission requirements. Goxis enforces these route policies; the middleware authorizer validates the access token and resolves its roles and grants. `QueueLimit` bounds waiting requests, while `MaxConcurrent` bounds active handlers.
+Los demás ejemplos se ejecutan con `go run ./examples/cryptodemo`, `auditdemo`, `logdemo`, `servicestokendemo` o `tokendemo`. Cada carpeta contiene instrucciones adicionales.
 
-Goxis logs every HTTP request after its middleware and route handler finish, including CORS preflights and 404/429/503 responses, in the Gin-style access format:
+## Verificación y preparación
 
-```text
-[GOXIS] 2026/10/23 - 03:35:33 | 200 |   4.23ms |    179.51.107.0 | POST     "/api/v0/products/sync"
+Ejecuta la suite del repositorio con:
+
+```sh
+go test ./...
+go vet ./...
+go build ./...
 ```
 
-The status is green for 2xx, blue for redirects, yellow for 4xx, and red for 5xx. When the logger is configured for JSON, requests remain structured JSON records. Common credential query parameters are redacted in access logs; avoid sending secrets in URLs.
+La cobertura existente se concentra en el router/servidor, logger, CORS y límites de crypto. Aún hace falta ampliar pruebas automatizadas para `security/token`, `security/audit`, autenticación/RBAC, expiración y rotación concurrente, además de fallos de almacenamiento y condiciones de carga. Por eso, el siguiente paso recomendado es una integración piloto con tráfico y dependencias reales, junto con pruebas de carga/seguridad antes de declarar Goxis listo para producción.
 
-## Seguridad y tokens
+## Licencia
 
-Goxis incluye `security/token` para emitir y validar tokens compactos JOSE cifrados con firma Ed25519 y AES-256-GCM, con rotación de refresh y almacenamientos intercambiables en memoria, Redis o SQL. La guía completa de configuración, interoperabilidad y operación está en [security/token/README.md](security/token/README.md).
-
-El ejemplo de emisión, lectura de claims y rotación se ejecuta con `go run ./examples/tokendemo` tras configurar `JWT_SECRET` con al menos 32 bytes aleatorios.
-
-## Módulos de seguridad
-
-`security/crypto` usa `golang.org/x/crypto` para Argon2id (default), bcrypt, scrypt y PBKDF2 con los presets de GoKit. AES-256-GCM y valores aleatorios usan Go estándar. Revisa la [guía crypto](security/crypto/README.md) para parámetros y configuración.
-
-`security/token` contiene tokens compactos cifrados y el administrador de sesiones. `security/audit` ofrece eventos, filtros, almacenamiento en memoria y exportación CSV/JSON/NDJSON. Para producción distribuida, inyecta implementaciones persistentes de `SessionStore` y `audit.Storage` (Redis o SQL, con el cliente/driver elegido por el proyecto). `security` define políticas por nivel y errores comunes.
-
-Guías: [crypto](security/crypto/README.md), [tokens y sesiones](security/token/README.md), [auditoría](security/audit/README.md), [middleware](middleware/README.md).
-
-El núcleo tiene su propia guía de [rutas, políticas y colas](app/README.md); los niveles/errores comunes se explican en [security](security/README.md). El logger describe el [default global y las instancias aisladas](log/README.md).
-
-Ejemplos ejecutables adicionales: `go run ./examples/cryptodemo` muestra hash, cifrado y generación de claves; `go run ./examples/auditdemo` muestra registro, consulta y exportación de auditoría; `go run ./examples/servicestokendemo` valida un token desde un servicio y extrae un claim específico.
+Este proyecto se distribuye bajo la licencia [MIT](LICENSE).

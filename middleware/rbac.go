@@ -41,23 +41,10 @@ func NewRBAC(manager AccessTokenValidator, roles ...Role) *RBAC {
 }
 
 func (r *RBAC) Authorize(ctx *goxis.Context, policy goxis.Policy) error {
-	if r == nil || r.manager == nil {
-		return goxis.ErrAccessControlUnavailable
+	if err := r.Authenticate(ctx); err != nil {
+		return err
 	}
-	claims, ok := ClaimsFromContext(ctx)
-	if !ok {
-		parts := strings.Fields(ctx.Request.Header.Get("Authorization"))
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
-			return goxis.ErrUnauthenticated
-		}
-		var err error
-		claims, err = r.manager.ValidateAccessToken(parts[1])
-		if err != nil {
-			return goxis.ErrUnauthenticated
-		}
-		setClaims(ctx, claims)
-	}
-	ctx.MarkAuthenticated()
+	claims, _ := ClaimsFromContext(ctx)
 
 	userRoles := make(map[string]struct{}, len(claims.Roles))
 	grants := make(map[string]struct{}, len(claims.Permissions))
@@ -95,11 +82,35 @@ func (r *RBAC) Authorize(ctx *goxis.Context, policy goxis.Policy) error {
 	return nil
 }
 
+// Authenticate validates the access token once and stores its user identity
+// for authorization and per-user route rate limiting.
+func (r *RBAC) Authenticate(ctx *goxis.Context) error {
+	if r == nil || r.manager == nil {
+		return goxis.ErrAccessControlUnavailable
+	}
+	if claims, ok := ClaimsFromContext(ctx); ok {
+		ctx.SetAuthenticatedIdentity(claims.UserID)
+		return nil
+	}
+	parts := strings.Fields(ctx.Request.Header.Get("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+		return goxis.ErrUnauthenticated
+	}
+	claims, err := r.manager.ValidateAccessToken(parts[1])
+	if err != nil {
+		return goxis.ErrUnauthenticated
+	}
+	setClaims(ctx, claims)
+	ctx.SetAuthenticatedIdentity(claims.UserID)
+	return nil
+}
+
 func setClaims(ctx *goxis.Context, claims token.Claims) {
 	ctx.Set(ClaimsContextKey, claims)
 	ctx.Set(UserIDContextKey, claims.UserID)
 	ctx.Set("user_claims", claims)
 	ctx.Set("user_id", claims.UserID)
+	ctx.SetAuthenticatedIdentity(claims.UserID)
 	for key, value := range claims.CustomData {
 		ctx.Set(key, value)
 	}

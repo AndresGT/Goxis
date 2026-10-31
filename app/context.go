@@ -15,6 +15,7 @@ type Context struct {
 	mu            sync.RWMutex
 	written       bool
 	authenticated bool
+	identity      string
 }
 
 func newContext(writer http.ResponseWriter, request *http.Request, params map[string]string) *Context {
@@ -26,6 +27,15 @@ func (ctx *Context) Param(name string) string { return ctx.params[name] }
 
 // Query returns the first query value for name.
 func (ctx *Context) Query(name string) string { return ctx.Request.URL.Query().Get(name) }
+
+// RequestID returns the ID Goxis generated for this request and returned in
+// the X-Request-ID response header.
+func (ctx *Context) RequestID() string {
+	if ctx == nil {
+		return ""
+	}
+	return requestIDFromRequest(ctx.Request)
+}
 
 // Set stores a value for middleware and handlers during the request.
 func (ctx *Context) Set(key string, value any) {
@@ -81,6 +91,28 @@ func (ctx *Context) MarkAuthenticated() {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	ctx.authenticated = true
+}
+
+// SetAuthenticatedIdentity records the stable user identifier obtained from
+// verified credentials. Middleware should call this only after validation.
+func (ctx *Context) SetAuthenticatedIdentity(userID string) {
+	if ctx == nil || userID == "" {
+		return
+	}
+	ctx.mu.Lock()
+	ctx.identity = userID
+	ctx.authenticated = true
+	ctx.mu.Unlock()
+}
+
+// Identity returns the verified user identifier attached to this request.
+func (ctx *Context) Identity() string {
+	if ctx == nil {
+		return ""
+	}
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	return ctx.identity
 }
 
 // Authenticated reports whether middleware authenticated this request.

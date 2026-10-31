@@ -1,0 +1,17 @@
+# Runtime data, session secrets, and persistent demo logs.
+/logs/
+
+# Go build and test artifacts.
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage*.txt
+coverage*.html
+
+# Local editor and operating-system files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

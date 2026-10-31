@@ -23,8 +23,7 @@ func newRouteLimiter(limit int) *routeLimiter {
 	return &routeLimiter{limit: limit, clients: make(map[string]routeRateEntry)}
 }
 
-func (l *routeLimiter) allow(remoteAddr string, now time.Time) bool {
-	key := remoteIP(remoteAddr)
+func (l *routeLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry, exists := l.clients[key]
